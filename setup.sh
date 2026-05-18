@@ -1,102 +1,98 @@
 #!/bin/bash
-# Internet Forwarding Setup – Kali
-# Internet z WAN_IF přes LAN_IF do AP sítě
+# AP Hotspot Setup – Kali
+# Internet z eth0 (kabel) → wlan0 (USB dongle jako AP)
 
 set -e
 
-# === Konfigurace rozhraní ===
-WAN_IF="wlan0"           # internet (WiFi)
-LAN_IF="eth0"            # kabel do AP
-LAN_IP="192.168.100.50"  # statická IP Kali v AP síti
+# === Konfigurace ===
+WAN_IF="eth0"            # internet (kabel)
+AP_IF="wlan0"            # USB dongle → AP
+AP_IP="192.168.50.1"     # IP Kali na AP síti
+SSID="KaliHotspot"       # upravit v hostapd.conf
 
-echo "=== Internet Forwarding Setup (Kali) ==="
-echo "    WAN: $WAN_IF  →  LAN: $LAN_IF"
+echo "=== AP Hotspot Setup (Kali) ==="
+echo "    WAN: $WAN_IF (kabel)  →  AP: $AP_IF"
 
 if [ "$EUID" -ne 0 ]; then
     echo "Spusť jako root: sudo ./setup.sh"
     exit 1
 fi
 
-# 1. Kontrola rozhraní + statická IP na LAN
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 1. Kontrola rozhraní
 echo ""
-echo "1. Kontrola sítě..."
-ip link show "$LAN_IF" > /dev/null 2>&1 || { echo "Chyba: $LAN_IF nenalezeno"; exit 1; }
-ip link show "$WAN_IF" > /dev/null 2>&1 || { echo "Chyba: $WAN_IF nenalezeno"; exit 1; }
+echo "1. Kontrola rozhraní..."
+ip link show "$WAN_IF" > /dev/null 2>&1 || { echo "Chyba: $WAN_IF (kabel) nenalezeno"; exit 1; }
+ip link show "$AP_IF" > /dev/null 2>&1  || { echo "Chyba: $AP_IF nenalezeno"; exit 1; }
 
-echo "   Nastavuji statickou IP $LAN_IP na $LAN_IF..."
-ip addr flush dev "$LAN_IF" 2>/dev/null || true
-ip addr add "$LAN_IP/24" dev "$LAN_IF"
-ip link set "$LAN_IF" up
+# Ověř internet na WAN
+ping -c1 -W3 8.8.8.8 -I "$WAN_IF" > /dev/null 2>&1 || echo "   VAROVÁNÍ: $WAN_IF nemá internet!"
 
-echo "   $LAN_IF: $(ip addr show "$LAN_IF" | grep "inet " | awk '{print $2}' || echo 'bez IP')"
-echo "   $WAN_IF: $(ip addr show "$WAN_IF" | grep "inet " | awk '{print $2}' || echo 'bez IP')"
-
-# 2. IP Forwarding
+# 2. Odpoj AP_IF od NetworkManageru
 echo ""
-echo "2. Povolení IP Forwarding..."
+echo "2. Odpojuji $AP_IF od NetworkManageru..."
+nmcli dev disconnect "$AP_IF" 2>/dev/null || true
+nmcli dev set "$AP_IF" managed no 2>/dev/null || true
+
+# 3. Statická IP na AP interface
+echo ""
+echo "3. Nastavuji IP $AP_IP na $AP_IF..."
+ip addr flush dev "$AP_IF" 2>/dev/null || true
+ip addr add "$AP_IP/24" dev "$AP_IF"
+ip link set "$AP_IF" up
+
+# 4. hostapd
+echo ""
+echo "4. Spouštím hostapd (AP)..."
+pkill hostapd 2>/dev/null || true
+sleep 1
+hostapd -B "$SCRIPT_DIR/hostapd.conf" -P /run/hostapd_ap.pid \
+    && echo "   ✓ hostapd spuštěn (SSID: $SSID)" \
+    || { echo "   ✗ hostapd selhal"; exit 1; }
+
+# 5. IP Forwarding + NAT
+echo ""
+echo "5. IP Forwarding + NAT..."
 sysctl -w net.ipv4.ip_forward=1
 sysctl -w net.ipv4.conf.all.rp_filter=0
 
-# 3. NAT (iptables)
-echo ""
-echo "3. Nastavení NAT (iptables)..."
 iptables -t nat -D POSTROUTING -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
 iptables -t nat -A POSTROUTING -o "$WAN_IF" -j MASQUERADE
-iptables -D FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
-iptables -D FORWARD -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
-iptables -A FORWARD -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -D FORWARD -i "$AP_IF"  -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i "$WAN_IF" -o "$AP_IF"  -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+iptables -A FORWARD -i "$AP_IF"  -o "$WAN_IF" -j ACCEPT
+iptables -A FORWARD -i "$WAN_IF" -o "$AP_IF"  -m state --state RELATED,ESTABLISHED -j ACCEPT
 echo "   ✓ iptables nastaveny"
 
-# 4. DNS (dnsmasq)
+# 6. dnsmasq (DHCP + DNS pro klienty)
 echo ""
-echo "4. Nastavení DNS (dnsmasq)..."
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp "$SCRIPT_DIR/dnsmasq.conf" /etc/dnsmasq.conf
+echo "6. Nastavení dnsmasq..."
 
-# Kali: systemd-resolved může konfliktovat na portu 53
 if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     echo "   Zastavuji systemd-resolved (konflikt port 53)..."
     systemctl stop systemd-resolved
 fi
 
-systemctl enable dnsmasq
+cp "$SCRIPT_DIR/dnsmasq.conf" /etc/dnsmasq.conf
 systemctl restart dnsmasq && echo "   ✓ dnsmasq spuštěn" || echo "   ✗ dnsmasq selhal"
 
-# 4b. Docker FORWARD override
+# 7. Uložení iptables
 echo ""
-echo "4b. Docker FORWARD override..."
-if iptables -L DOCKER-USER &>/dev/null 2>&1; then
-    iptables -D DOCKER-USER -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
-    iptables -D DOCKER-USER -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-    iptables -I DOCKER-USER -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
-    iptables -I DOCKER-USER -i "$WAN_IF" -o "$LAN_IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
-    echo "   ✓ DOCKER-USER pravidla přidána"
-else
-    echo "   Docker není, přeskakuji"
-fi
-
-# 5. Uložení pravidel
-echo ""
-echo "5. Uložení iptables pravidel..."
+echo "7. Ukládám iptables pravidla..."
 mkdir -p /etc/iptables
 iptables-save > /etc/iptables/rules.v4
 
-# 6. Verifikace
+# 8. Verifikace
 echo ""
 echo "=== Verifikace ==="
-echo "IP Forwarding: $(cat /proc/sys/net/ipv4/ip_forward)"
+echo "IP Forwarding : $(cat /proc/sys/net/ipv4/ip_forward)"
+echo "hostapd PID   : $(cat /run/hostapd_ap.pid 2>/dev/null || echo 'nenalezeno')"
+echo "AP IP         : $(ip addr show "$AP_IF" | grep "inet " | awk '{print $2}')"
+echo "WAN IP        : $(ip addr show "$WAN_IF" | grep "inet " | awk '{print $2}')"
 echo ""
-echo "NAT pravidla:"
-iptables -t nat -L POSTROUTING -v | grep -A1 "Chain POSTROUTING"
-echo ""
-echo "FORWARD pravidla:"
-iptables -L FORWARD -v | head -5
-
-echo ""
-echo "✓ Forwarding nastaven!"
-echo ""
-echo "Příští kroky:"
-echo "1. Ověř AP gateway: měl by být IP $LAN_IF ($LAN_IP)"
-echo "2. Test na klientovi: ping 8.8.8.8"
-echo "3. Zastavení: sudo ./stop.sh"
+echo "✓ Hotspot aktivní!"
+echo "  SSID     : $SSID"
+echo "  Heslo    : viz hostapd.conf (wpa_passphrase)"
+echo "  AP subnet: 192.168.50.0/24  (gateway: $AP_IP)"
+echo "  Zastavení: sudo ./stop.sh"
